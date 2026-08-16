@@ -37,6 +37,9 @@ export function PortfolioComposition({
                 />
                 <span className="flex-1 truncate text-[13px] font-medium text-zinc-200">
                   {asset.ticker}
+                  <span className="ml-1.5 rounded bg-surface-2 px-1 py-0.5 text-[10px] font-normal text-muted-2">
+                    {asset.currency}
+                  </span>
                 </span>
                 <span
                   className="font-mono text-[12.5px] font-semibold"

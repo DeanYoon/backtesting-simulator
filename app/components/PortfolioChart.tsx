@@ -17,17 +17,22 @@ import {
 import zoomPlugin from "chartjs-plugin-zoom";
 import "chartjs-adapter-date-fns";
 import {
+  computeCalmarRatio,
   computeMaxDrawdown,
+  computePearsonCorrelation,
   computeRollingCAGR,
+  computeSharpeRatio,
+  computeSortinoRatio,
   findParetoFrontier,
   generateWeightCombinations,
   summarizeRollingCAGR,
 } from "@/app/lib/metrics";
 import { calcMDDSegments } from "@/app/lib/mdd";
-import { simulateDCA, type RebalanceEvent } from "@/app/lib/dca";
-import { simulateCashBuffer, type CashDeployEvent } from "@/app/lib/cashBuffer";
+import { computeVolatilityThresholds, simulateDCA, type RebalanceEvent } from "@/app/lib/dca";
+import { simulateCashBuffer, type CashRebalanceEvent } from "@/app/lib/cashBuffer";
 import { combineWeightedSeries } from "@/app/lib/portfolio";
-import type { SeriesPoint } from "@/app/lib/types";
+import { CURRENCIES, CURRENCY_LABELS } from "@/app/lib/currency";
+import type { Currency, SeriesPoint } from "@/app/lib/types";
 
 // Registers the option shape for our local `deepDrawdownLines` plugin so
 // `options.plugins.deepDrawdownLines` type-checks like any built-in plugin.
@@ -49,6 +54,10 @@ Chart.register(
   Filler,
   zoomPlugin,
 );
+
+// Disables the default "grow in from the baseline" animation on initial
+// render and data updates for every chart in this file.
+Chart.defaults.animation = false;
 
 // Draws a red dashed vertical line at each configured timestamp — used to
 // mark the deep (-20%+) drawdown episodes on the DCA chart. Configured
@@ -80,6 +89,7 @@ const deepDrawdownLinePlugin: Plugin<"line"> = {
 };
 
 const DAY_MS = 1000 * 60 * 60 * 24;
+const YEAR_MS = DAY_MS * 365.25;
 const MIN_ZOOM_RANGE_MS = DAY_MS * 14;
 const PEAK_COLOR = "#e74c3c";
 const TROUGH_COLOR = "#3498db";
@@ -87,6 +97,12 @@ const MARKER_RING_COLOR = "#0f0f1a";
 const COMBO_COLOR = "#4a4a6a";
 const PARETO_COLOR = "#16a085";
 const CURRENT_COMBO_COLOR = "#f1c40f";
+const CASH_COLOR = "#e67e22";
+const DCA_REBAL_COLOR = "#3498db";
+// Cash<->stock rebalance markers use CURRENT_COMBO_COLOR (gold); ticker-vs-
+// ticker rebalance markers use this distinct purple so the two rebalance
+// types are visually distinguishable at a glance on the chart.
+const STOCK_REBAL_COLOR = "#9b59b6";
 // Threshold for counting "deep" drawdown episodes in the DCA summary.
 const DEEP_DRAWDOWN_THRESHOLD = 0.2;
 
@@ -102,6 +118,29 @@ export type ChartSeries = {
 // sub-5% wobbles) only ever gets a single red dot, at whichever point is
 // currently the all-time high.
 const TROUGH_DROP_THRESHOLD = 0.05;
+
+// Simple CAGR-style annualization of a total return over the given date
+// span - treats the total (finalValue / invested) growth as if it compounded
+// evenly over the whole period, ignoring the actual timing of individual DCA
+// contributions.
+function annualizedReturnPct(
+  finalValue: number,
+  invested: number,
+  startDate: string,
+  endDate: string,
+): number | null {
+  if (invested <= 0 || finalValue <= 0) return null;
+  const years = (new Date(endDate).getTime() - new Date(startDate).getTime()) / YEAR_MS;
+  if (years <= 0) return null;
+  return (Math.pow(finalValue / invested, 1 / years) - 1) * 100;
+}
+
+// Renders a weight combination as "A:B:C 10:30:60" instead of
+// "A 10% · B 30% · C 60%" - putting the tickers and their ratio on their own
+// halves reads faster once there are 3+ assets.
+function formatWeightRatio(tickers: { label: string }[], weightsArray: number[]): string {
+  return `${tickers.map((t) => t.label).join(":")} ${weightsArray.join(":")}`;
+}
 
 function findPeaksAndTroughs(values: number[]) {
   const peakIndices = new Set<number>();
@@ -164,6 +203,9 @@ type ComboPoint = {
   weights: number[];
   returnPct: number;
   mddPct: number;
+  sharpe: number | null;
+  sortino: number | null;
+  calmar: number | null;
   positiveCount?: number;
   totalCount?: number;
   label: string;
@@ -174,9 +216,15 @@ type RiskMode = "rolling" | "lumpsum";
 export function PortfolioChart({
   series,
   weights = {},
+  displayCurrency,
+  onCurrencyChange,
+  currencyLoading,
 }: {
   series: ChartSeries[];
   weights?: Record<string, number>;
+  displayCurrency?: Currency;
+  onCurrencyChange?: (currency: Currency) => void;
+  currencyLoading?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<Tab>("growth");
   const growthCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -190,24 +238,42 @@ export function PortfolioChart({
   const [dcaEmpty, setDcaEmpty] = useState<string | null>(null);
   const [dcaSummary, setDcaSummary] = useState<
     {
-      rebalanced: boolean;
+      key: string;
+      label: string;
       finalValue: number;
       invested: number;
       returnPct: number;
+      annualizedReturnPct: number | null;
       mddPct: number;
       // each entry is one -20%+ drawdown episode's drop, as a negative fraction
       deepDrawdowns: number[];
     }[]
   >([]);
   const [dcaEvents, setDcaEvents] = useState<(RebalanceEvent & { tickerLabels: string[] })[]>([]);
+  const [dcaVolatilityEvents, setDcaVolatilityEvents] = useState<
+    (RebalanceEvent & { tickerLabels: string[] })[]
+  >([]);
+  const [dcaVolatilityThresholds, setDcaVolatilityThresholds] = useState<
+    { label: string; thresholdPct: number }[]
+  >([]);
   const [cashRatioInput, setCashRatioInput] = useState("20");
-  const [trigger1Input, setTrigger1Input] = useState("-15");
-  const [trigger2Input, setTrigger2Input] = useState("-25");
   const [cashBufferEmpty, setCashBufferEmpty] = useState<string | null>(null);
   const [cashBufferSummary, setCashBufferSummary] = useState<
-    { label: string; finalValue: number; invested: number; returnPct: number; mddPct: number }[]
+    {
+      label: string;
+      finalValue: number;
+      invested: number;
+      returnPct: number;
+      annualizedReturnPct: number | null;
+      mddPct: number;
+    }[]
   >([]);
-  const [cashBufferEvents, setCashBufferEvents] = useState<CashDeployEvent[]>([]);
+  const [cashBufferEvents, setCashBufferEvents] = useState<
+    (CashRebalanceEvent & { tickerLabels: string[] })[]
+  >([]);
+  const [cashBufferDcaEvents, setCashBufferDcaEvents] = useState<
+    (RebalanceEvent & { tickerLabels: string[] })[]
+  >([]);
   const [visible, setVisible] = useState<Record<string, boolean>>({});
   const [baseDateLabel, setBaseDateLabel] = useState<string | null>(null);
   const [holdingYearsInput, setHoldingYearsInput] = useState("1");
@@ -448,13 +514,24 @@ export function PortfolioChart({
     }
 
     function computeMetrics(data: SeriesPoint[]) {
+      const sharpe = computeSharpeRatio(data);
+      const sortino = computeSortinoRatio(data);
+
       if (riskMode === "lumpsum") {
         if (data.length < 2 || data[0].value <= 0) return null;
         const first = data[0].value;
         const last = data[data.length - 1].value;
+        const years =
+          (new Date(data[data.length - 1].date).getTime() - new Date(data[0].date).getTime()) /
+          YEAR_MS;
+        const annualizedReturn = years > 0 ? Math.pow(last / first, 1 / years) - 1 : 0;
+        const mddFraction = computeMaxDrawdown(data);
         return {
           returnPct: (last / first - 1) * 100,
-          mddPct: computeMaxDrawdown(data) * 100,
+          mddPct: mddFraction * 100,
+          sharpe,
+          sortino,
+          calmar: computeCalmarRatio(annualizedReturn, mddFraction),
         };
       }
       const summary = summarizeRollingCAGR(computeRollingCAGR(data, holdingYears));
@@ -468,6 +545,9 @@ export function PortfolioChart({
         mddPct: summary.avgMaxDrawdown * 100,
         positiveCount: summary.positiveCount,
         totalCount: summary.total,
+        sharpe,
+        sortino,
+        calmar: computeCalmarRatio(summary.avgCagr, summary.avgMaxDrawdown),
       };
     }
 
@@ -481,7 +561,7 @@ export function PortfolioChart({
       comboPoints.push({
         weights: combo,
         ...metrics,
-        label: tickerSeries.map((t, i) => `${t.label} ${combo[i]}%`).join(" · "),
+        label: formatWeightRatio(tickerSeries, combo),
       });
     }
 
@@ -529,9 +609,7 @@ export function PortfolioChart({
         currentPoint = {
           weights: currentWeightsArray,
           ...metrics,
-          label: `현재 비중 (${tickerSeries
-            .map((t, i) => `${t.label} ${currentWeightsArray[i]}%`)
-            .join(" · ")})`,
+          label: `현재 비중 (${formatWeightRatio(tickerSeries, currentWeightsArray)})`,
         };
       }
     }
@@ -652,6 +730,12 @@ export function PortfolioChart({
                     `수익 구간 ${detail.positiveCount}/${detail.totalCount} (${winRate}%)`,
                   );
                 }
+                if (detail) {
+                  const fmt = (v: number | null) => (v == null ? "-" : v.toFixed(2));
+                  lines.push(
+                    `샤프 ${fmt(detail.sharpe)} · 소르티노 ${fmt(detail.sortino)} · 칼마 ${fmt(detail.calmar)}`,
+                  );
+                }
                 return lines;
               },
             },
@@ -686,40 +770,85 @@ export function PortfolioChart({
     const { points: withRebalance, events: rebalanceEvents } = simulateDCA(tickerInputs, weights, {
       rebalanceMode: "threshold",
     });
+    const { points: withVolatility, events: volatilityEvents } = simulateDCA(
+      tickerInputs,
+      weights,
+      { rebalanceMode: "volatility" },
+    );
 
-    if (noRebalance.length === 0 || withRebalance.length === 0) {
+    if (noRebalance.length === 0 || withRebalance.length === 0 || withVolatility.length === 0) {
       setDcaEmpty("데이터가 부족합니다");
       setDcaSummary([]);
       setDcaEvents([]);
+      setDcaVolatilityEvents([]);
+      setDcaVolatilityThresholds([]);
       return;
     }
     setDcaEmpty(null);
     setDcaEvents(rebalanceEvents.map((e) => ({ ...e, tickerLabels })));
+    setDcaVolatilityEvents(volatilityEvents.map((e) => ({ ...e, tickerLabels })));
+    const volatilityThresholds = computeVolatilityThresholds(tickerInputs);
+    setDcaVolatilityThresholds(
+      tickerLabels.map((label, i) => ({ label, thresholdPct: volatilityThresholds[i] })),
+    );
 
     const xMin = new Date(noRebalance[0].date).getTime();
     const xMax = new Date(noRebalance[noRebalance.length - 1].date).getTime();
 
     const lastNo = noRebalance[noRebalance.length - 1];
     const lastWith = withRebalance[withRebalance.length - 1];
+    const lastVolatility = withVolatility[withVolatility.length - 1];
     const noRebalanceSeries = noRebalance.map((p) => ({ date: p.date, value: p.value }));
     const withRebalanceSeries = withRebalance.map((p) => ({ date: p.date, value: p.value }));
+    const withVolatilitySeries = withVolatility.map((p) => ({ date: p.date, value: p.value }));
     const noRebalanceDeepSegments = calcMDDSegments(noRebalanceSeries, DEEP_DRAWDOWN_THRESHOLD);
     setDcaSummary([
       {
-        rebalanced: false,
+        key: "no-rebal",
+        label: "리밸런싱 없음",
         finalValue: lastNo.value,
         invested: lastNo.invested,
         returnPct: (lastNo.value / lastNo.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastNo.value,
+          lastNo.invested,
+          noRebalance[0].date,
+          lastNo.date,
+        ),
         mddPct: computeMaxDrawdown(noRebalanceSeries) * 100,
         deepDrawdowns: noRebalanceDeepSegments.map((seg) => seg.dropPct),
       },
       {
-        rebalanced: true,
+        key: "rebal",
+        label: "비율 이탈 시 리밸런싱 (고정 10%p)",
         finalValue: lastWith.value,
         invested: lastWith.invested,
         returnPct: (lastWith.value / lastWith.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastWith.value,
+          lastWith.invested,
+          withRebalance[0].date,
+          lastWith.date,
+        ),
         mddPct: computeMaxDrawdown(withRebalanceSeries) * 100,
         deepDrawdowns: calcMDDSegments(withRebalanceSeries, DEEP_DRAWDOWN_THRESHOLD).map(
+          (seg) => seg.dropPct,
+        ),
+      },
+      {
+        key: "volatility",
+        label: "변동성 기준 리밸런싱",
+        finalValue: lastVolatility.value,
+        invested: lastVolatility.invested,
+        returnPct: (lastVolatility.value / lastVolatility.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastVolatility.value,
+          lastVolatility.invested,
+          withVolatility[0].date,
+          lastVolatility.date,
+        ),
+        mddPct: computeMaxDrawdown(withVolatilitySeries) * 100,
+        deepDrawdowns: calcMDDSegments(withVolatilitySeries, DEEP_DRAWDOWN_THRESHOLD).map(
           (seg) => seg.dropPct,
         ),
       },
@@ -728,6 +857,13 @@ export function PortfolioChart({
     const eventDates = new Set(rebalanceEvents.map((e) => e.date));
     const rebalPointRadius = withRebalance.map((p) => (eventDates.has(p.date) ? 5 : 0));
     const rebalPointHoverRadius = withRebalance.map((p) => (eventDates.has(p.date) ? 7 : 4));
+    const volatilityEventDates = new Set(volatilityEvents.map((e) => e.date));
+    const volatilityPointRadius = withVolatility.map((p) =>
+      volatilityEventDates.has(p.date) ? 5 : 0,
+    );
+    const volatilityPointHoverRadius = withVolatility.map((p) =>
+      volatilityEventDates.has(p.date) ? 7 : 4,
+    );
     const deepDrawdownTimestamps = noRebalanceDeepSegments.map((seg) =>
       new Date(seg.troughDate).getTime(),
     );
@@ -763,6 +899,19 @@ export function PortfolioChart({
             borderWidth: 2,
             pointRadius: rebalPointRadius,
             pointHoverRadius: rebalPointHoverRadius,
+            pointBackgroundColor: CURRENT_COMBO_COLOR,
+            pointBorderColor: MARKER_RING_COLOR,
+            pointBorderWidth: 1,
+            fill: false,
+            tension: 0.1,
+          },
+          {
+            label: "DCA (변동성 기준 리밸런싱)",
+            data: withVolatility.map((p) => ({ x: new Date(p.date).getTime(), y: p.value })),
+            borderColor: DCA_REBAL_COLOR,
+            borderWidth: 2,
+            pointRadius: volatilityPointRadius,
+            pointHoverRadius: volatilityPointHoverRadius,
             pointBackgroundColor: CURRENT_COMBO_COLOR,
             pointBorderColor: MARKER_RING_COLOR,
             pointBorderWidth: 1,
@@ -805,6 +954,12 @@ export function PortfolioChart({
                 if (context.datasetIndex === 2 && eventDates.has(withRebalance[context.dataIndex].date)) {
                   return `${base}  🔁 리밸런싱`;
                 }
+                if (
+                  context.datasetIndex === 3 &&
+                  volatilityEventDates.has(withVolatility[context.dataIndex].date)
+                ) {
+                  return `${base}  🔁 리밸런싱`;
+                }
                 return base;
               },
             },
@@ -838,9 +993,11 @@ export function PortfolioChart({
     dcaChartRef.current?.resetZoom();
   }
 
-  // Cash-buffer tactical strategy vs plain DCA: hold back part of each
-  // contribution as cash, deploy it in tiers as the market draws down past
-  // configured trigger levels, reset the triggers on every new high.
+  // Cash-buffer tactical strategy vs plain DCA vs DCA-with-rebalancing: hold
+  // back part of each contribution as cash, and whenever cash or any
+  // individual ticker's weight drifts 10%p or more from its target, rebalance
+  // the whole position (cash included) back to target - same threshold rule
+  // as the DCA tab's own rebalancing mode.
   useEffect(() => {
     if (activeTab !== "cashbuffer" || !cashBufferCanvasRef.current) return;
 
@@ -852,26 +1009,59 @@ export function PortfolioChart({
     }
 
     const cashRatio = Math.min(1, Math.max(0, (Number(cashRatioInput) || 0) / 100));
-    const trigger1 = Math.min(0, Number(trigger1Input) || -15) / 100;
-    const trigger2 = Math.min(0, Number(trigger2Input) || -25) / 100;
+    const monthlyAmount = 100;
 
     const tickerInputs = tickerSeries.map((s) => ({ ticker: s.id, data: s.data }));
     const { points: pureDca } = simulateDCA(tickerInputs, weights, { rebalanceMode: "none" });
-    const { points: buffered, events: deployEvents } = simulateCashBuffer(tickerInputs, weights, {
+    // Same cash carve-out ratio as the cash-buffer strategy below, so the
+    // comparison is apples-to-apples: only the invested (1 - cashRatio)
+    // portion goes into tickers and gets threshold-rebalanced among them;
+    // the cash portion just accumulates from monthly contributions,
+    // untouched by any drawdown-based deploy/refill (unlike 현금버퍼, which
+    // actively rebalances cash itself).
+    const { points: dcaStockOnly, events: dcaRebalanceEvents } = simulateDCA(
+      tickerInputs,
+      weights,
+      { rebalanceMode: "threshold", monthlyAmount: monthlyAmount * (1 - cashRatio) },
+    );
+    const dcaIdleCashAmount = monthlyAmount * cashRatio;
+    let dcaIdleCashAccum = 0;
+    let dcaIdleCashMonthKey = "";
+    const dcaRebalanced = dcaStockOnly.map((p) => {
+      const monthKey = p.date.slice(0, 7);
+      if (monthKey !== dcaIdleCashMonthKey) {
+        dcaIdleCashMonthKey = monthKey;
+        dcaIdleCashAccum += dcaIdleCashAmount;
+      }
+      return {
+        date: p.date,
+        value: p.value + dcaIdleCashAccum,
+        invested: p.invested + dcaIdleCashAccum,
+      };
+    });
+    const { points: buffered, events: rebalanceEvents } = simulateCashBuffer(tickerInputs, weights, {
       cashRatio,
-      triggerLevels: [trigger1, trigger2],
+      monthlyAmount,
     });
 
-    if (pureDca.length === 0 || buffered.length === 0) {
+    if (pureDca.length === 0 || dcaRebalanced.length === 0 || buffered.length === 0) {
       setCashBufferEmpty("데이터가 부족합니다");
       setCashBufferSummary([]);
       setCashBufferEvents([]);
+      setCashBufferDcaEvents([]);
       return;
     }
     setCashBufferEmpty(null);
-    setCashBufferEvents(deployEvents);
+    const cashBufferTickerLabels = tickerSeries.map((s) => s.label);
+    setCashBufferEvents(
+      rebalanceEvents.map((e) => ({ ...e, tickerLabels: cashBufferTickerLabels })),
+    );
+    setCashBufferDcaEvents(
+      dcaRebalanceEvents.map((e) => ({ ...e, tickerLabels: cashBufferTickerLabels })),
+    );
 
     const lastDca = pureDca[pureDca.length - 1];
+    const lastDcaRebalanced = dcaRebalanced[dcaRebalanced.length - 1];
     const lastBuffered = buffered[buffered.length - 1];
     setCashBufferSummary([
       {
@@ -879,13 +1069,39 @@ export function PortfolioChart({
         finalValue: lastDca.value,
         invested: lastDca.invested,
         returnPct: (lastDca.value / lastDca.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastDca.value,
+          lastDca.invested,
+          pureDca[0].date,
+          lastDca.date,
+        ),
         mddPct: computeMaxDrawdown(pureDca.map((p) => ({ date: p.date, value: p.value }))) * 100,
+      },
+      {
+        label: "DCA (현금보유+리밸런싱)",
+        finalValue: lastDcaRebalanced.value,
+        invested: lastDcaRebalanced.invested,
+        returnPct: (lastDcaRebalanced.value / lastDcaRebalanced.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastDcaRebalanced.value,
+          lastDcaRebalanced.invested,
+          dcaRebalanced[0].date,
+          lastDcaRebalanced.date,
+        ),
+        mddPct:
+          computeMaxDrawdown(dcaRebalanced.map((p) => ({ date: p.date, value: p.value }))) * 100,
       },
       {
         label: "현금버퍼",
         finalValue: lastBuffered.totalValue,
         invested: lastBuffered.invested,
         returnPct: (lastBuffered.totalValue / lastBuffered.invested - 1) * 100,
+        annualizedReturnPct: annualizedReturnPct(
+          lastBuffered.totalValue,
+          lastBuffered.invested,
+          buffered[0].date,
+          lastBuffered.date,
+        ),
         mddPct:
           computeMaxDrawdown(buffered.map((p) => ({ date: p.date, value: p.totalValue }))) * 100,
       },
@@ -894,9 +1110,18 @@ export function PortfolioChart({
     const xMin = new Date(pureDca[0].date).getTime();
     const xMax = new Date(pureDca[pureDca.length - 1].date).getTime();
 
-    const eventDates = new Set(deployEvents.map((e) => e.date));
-    const bufferPointRadius = buffered.map((p) => (eventDates.has(p.date) ? 5 : 0));
-    const bufferPointHoverRadius = buffered.map((p) => (eventDates.has(p.date) ? 7 : 4));
+    const eventLevelByDate = new Map(rebalanceEvents.map((e) => [e.date, e.level]));
+    const bufferPointRadius = buffered.map((p) => (eventLevelByDate.has(p.date) ? 5 : 0));
+    const bufferPointHoverRadius = buffered.map((p) => (eventLevelByDate.has(p.date) ? 7 : 4));
+    const bufferPointColor = buffered.map((p) =>
+      eventLevelByDate.get(p.date) === "stock" ? STOCK_REBAL_COLOR : CURRENT_COMBO_COLOR,
+    );
+
+    const dcaEventDates = new Set(dcaRebalanceEvents.map((e) => e.date));
+    const dcaRebalPointRadius = dcaRebalanced.map((p) => (dcaEventDates.has(p.date) ? 5 : 0));
+    const dcaRebalPointHoverRadius = dcaRebalanced.map((p) =>
+      dcaEventDates.has(p.date) ? 7 : 4,
+    );
 
     cashBufferChartRef.current = new Chart(cashBufferCanvasRef.current, {
       type: "line",
@@ -928,6 +1153,28 @@ export function PortfolioChart({
             borderWidth: 2,
             pointRadius: bufferPointRadius,
             pointHoverRadius: bufferPointHoverRadius,
+            pointBackgroundColor: bufferPointColor,
+            pointBorderColor: MARKER_RING_COLOR,
+            pointBorderWidth: 1,
+            fill: false,
+            tension: 0.1,
+          },
+          {
+            label: "순수 현금 보유액",
+            data: buffered.map((p) => ({ x: new Date(p.date).getTime(), y: p.cashPool })),
+            borderColor: CASH_COLOR,
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: false,
+            tension: 0.1,
+          },
+          {
+            label: "DCA (현금보유+리밸런싱)",
+            data: dcaRebalanced.map((p) => ({ x: new Date(p.date).getTime(), y: p.value })),
+            borderColor: DCA_REBAL_COLOR,
+            borderWidth: 1.5,
+            pointRadius: dcaRebalPointRadius,
+            pointHoverRadius: dcaRebalPointHoverRadius,
             pointBackgroundColor: CURRENT_COMBO_COLOR,
             pointBorderColor: MARKER_RING_COLOR,
             pointBorderWidth: 1,
@@ -966,13 +1213,37 @@ export function PortfolioChart({
             callbacks: {
               label: (context) => {
                 const base = `${context.dataset.label}: ${Number(context.parsed.y).toLocaleString()}`;
-                if (context.datasetIndex === 2 && eventDates.has(buffered[context.dataIndex].date)) {
-                  const event = deployEvents.find((e) => e.date === buffered[context.dataIndex].date);
+                if (
+                  context.datasetIndex === 2 &&
+                  eventLevelByDate.has(buffered[context.dataIndex].date)
+                ) {
+                  const event = rebalanceEvents.find(
+                    (e) => e.date === buffered[context.dataIndex].date,
+                  );
                   if (event) {
-                    return `${base}  💰 현금 투입 (낙폭 ${(event.drawdown * 100).toFixed(1)}%, ${event.deployAmount.toLocaleString()} 투입)`;
+                    const labels = event.level === "cash" ? ["현금", "주식"] : cashBufferTickerLabels;
+                    const detail = labels
+                      .map((label, i) => `${label} ${event.beforeRatio[i]}%→${event.afterRatio[i]}%`)
+                      .join(" · ");
+                    const icon = event.level === "cash" ? "💰 현금 리밸런싱" : "🔄 종목 리밸런싱";
+                    return `${base}  ${icon} (${detail})`;
                   }
                 }
+                if (
+                  context.datasetIndex === 4 &&
+                  dcaEventDates.has(dcaRebalanced[context.dataIndex].date)
+                ) {
+                  return `${base}  🔁 리밸런싱`;
+                }
                 return base;
+              },
+              afterBody: (items) => {
+                if (items.length === 0) return [];
+                const p = buffered[items[0].dataIndex];
+                if (!p || p.totalValue <= 0) return [];
+                const cashPct = (p.cashPool / p.totalValue) * 100;
+                const stockPct = (p.investedValue / p.totalValue) * 100;
+                return [`현금 ${cashPct.toFixed(1)}% · 주식 ${stockPct.toFixed(1)}%`];
               },
             },
           },
@@ -999,7 +1270,7 @@ export function PortfolioChart({
       cashBufferChartRef.current?.destroy();
       cashBufferChartRef.current = null;
     };
-  }, [series, activeTab, weights, cashRatioInput, trigger1Input, trigger2Input]);
+  }, [series, activeTab, weights, cashRatioInput]);
 
   function handleCashBufferReset() {
     cashBufferChartRef.current?.resetZoom();
@@ -1038,49 +1309,85 @@ export function PortfolioChart({
     return days === null ? "진행중" : `${days}일`;
   }
 
+  // Pairwise correlation of daily returns between every ticker (excluding
+  // the blended "portfolio" series) - independent of weight combos, so it's
+  // computed once from the raw series rather than inside the grid-search
+  // effect.
+  const correlationMatrix = useMemo(() => {
+    const tickerSeries = series.filter((s) => s.id !== "portfolio");
+    if (tickerSeries.length < 2) return null;
+    const matrix = tickerSeries.map((a) =>
+      tickerSeries.map((b) =>
+        a.id === b.id ? 1 : computePearsonCorrelation(a.data, b.data),
+      ),
+    );
+    return { tickers: tickerSeries, matrix };
+  }, [series]);
+
   return (
     <div className="flex h-full flex-col rounded-lg border border-border bg-surface">
-      <div className="flex items-center gap-1.5 border-b border-border px-3 py-2">
-        <button
-          onClick={() => setActiveTab("growth")}
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
-            activeTab === "growth"
-              ? "bg-blue text-white"
-              : "bg-surface-2 text-muted hover:text-zinc-200"
-          }`}
-        >
-          성장 그래프
-        </button>
-        <button
-          onClick={() => setActiveTab("risk")}
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
-            activeTab === "risk"
-              ? "bg-blue text-white"
-              : "bg-surface-2 text-muted hover:text-zinc-200"
-          }`}
-        >
-          위험-수익
-        </button>
-        <button
-          onClick={() => setActiveTab("dca")}
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
-            activeTab === "dca"
-              ? "bg-blue text-white"
-              : "bg-surface-2 text-muted hover:text-zinc-200"
-          }`}
-        >
-          DCA
-        </button>
-        <button
-          onClick={() => setActiveTab("cashbuffer")}
-          className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
-            activeTab === "cashbuffer"
-              ? "bg-blue text-white"
-              : "bg-surface-2 text-muted hover:text-zinc-200"
-          }`}
-        >
-          현금버퍼
-        </button>
+      <div className="flex items-center justify-between gap-1.5 border-b border-border px-3 py-2">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            onClick={() => setActiveTab("growth")}
+            className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
+              activeTab === "growth"
+                ? "bg-blue text-white"
+                : "bg-surface-2 text-muted hover:text-zinc-200"
+            }`}
+          >
+            성장 그래프
+          </button>
+          <button
+            onClick={() => setActiveTab("risk")}
+            className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
+              activeTab === "risk"
+                ? "bg-blue text-white"
+                : "bg-surface-2 text-muted hover:text-zinc-200"
+            }`}
+          >
+            위험-수익
+          </button>
+          <button
+            onClick={() => setActiveTab("dca")}
+            className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
+              activeTab === "dca"
+                ? "bg-blue text-white"
+                : "bg-surface-2 text-muted hover:text-zinc-200"
+            }`}
+          >
+            DCA
+          </button>
+          <button
+            onClick={() => setActiveTab("cashbuffer")}
+            className={`rounded-md px-3 py-1.5 text-[12px] font-semibold transition ${
+              activeTab === "cashbuffer"
+                ? "bg-blue text-white"
+                : "bg-surface-2 text-muted hover:text-zinc-200"
+            }`}
+          >
+            현금버퍼
+          </button>
+        </div>
+        {displayCurrency && onCurrencyChange && (
+          <div className="flex shrink-0 items-center gap-1">
+            {currencyLoading && <span className="mr-1 text-[10.5px] text-muted">환율 불러오는 중...</span>}
+            {CURRENCIES.map((c) => (
+              <button
+                key={c}
+                onClick={() => onCurrencyChange(c)}
+                title={CURRENCY_LABELS[c]}
+                className={`h-7 rounded-md px-2.5 text-[11.5px] font-semibold transition ${
+                  displayCurrency === c
+                    ? "bg-purple text-white"
+                    : "bg-surface-2 text-muted hover:text-zinc-200"
+                }`}
+              >
+                {c === "USD" ? "달러" : c === "KRW" ? "원" : "엔"}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       {activeTab === "growth" && (
       <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-2">
@@ -1214,6 +1521,24 @@ export function PortfolioChart({
                   </tbody>
                 </table>
               </div>
+              {mddRows.length > 0 && (
+                <div className="mt-2 text-[11px] text-muted">
+                  총 <span className="font-mono text-zinc-200">{mddRows.length}</span>회 하락
+                  (평균 낙폭{" "}
+                  <span className="font-mono text-red">
+                    {(
+                      (mddRows.reduce((sum, r) => sum + r.seg.dropPct, 0) / mddRows.length) *
+                      100
+                    ).toFixed(1)}
+                    %
+                  </span>{" "}
+                  · 최대 낙폭{" "}
+                  <span className="font-mono text-red">
+                    {(Math.min(...mddRows.map((r) => r.seg.dropPct)) * 100).toFixed(1)}%
+                  </span>
+                  )
+                </div>
+              )}
             </div>
           )}
         </>
@@ -1299,40 +1624,150 @@ export function PortfolioChart({
           </div>
           {paretoCombos.length > 0 && (
             <div className="overflow-x-auto border-t border-border p-3">
-              <div className="mb-2 text-[11px] text-muted">
-                파레토 최적 조합 (같은 위험에서 더 높은 수익, 또는 같은 수익에서 더 낮은
-                위험인 조합만 남긴 것 — 수익률 높은 순)
+              <div className="mb-1 text-[11px] text-muted">
+                파레토 최적 조합 — 같은 위험에서 더 높은 수익, 또는 같은 수익에서 더 낮은
+                위험인 조합만 남긴 목록입니다 (수익률 높은 순 정렬). 비중 구성은
+                &quot;종목:종목 비율:비율&quot; 순서로 표시됩니다.
               </div>
-              <table className="w-full min-w-120 text-[11.5px]">
+              <ul className="mb-2 list-inside list-disc space-y-0.5 pl-0.5 text-[11px] text-muted marker:text-zinc-600">
+                <li>
+                  <span className="font-semibold text-zinc-300">샤프지수</span> = (연평균
+                  수익률 − 무위험수익률) ÷ 변동성(표준편차). 상승·하락을 가리지 않고 &quot;가격이
+                  얼마나 출렁였는지&quot; 전체를 위험으로 보고, 그 위험 대비 보상을 나타냅니다.
+                  무위험수익률은 0%로 가정. 통상 1 이상이면 양호, 2 이상이면 우수한 편으로 봅니다.
+                </li>
+                <li>
+                  <span className="font-semibold text-zinc-300">소르티노지수</span> = (연평균
+                  수익률 − 무위험수익률) ÷ 하락 변동성. 계산 방식은 샤프지수와 비슷하지만
+                  상승할 때의 출렁임은 위험으로 치지 않고, 손실이 난 날의 변동성만 분모에
+                  반영합니다. 그래서 상승폭 자체는 큰 자산은 샤프보다 소르티노가 더 높게 나옵니다.
+                </li>
+                <li>
+                  <span className="font-semibold text-zinc-300">칼마지수</span> = 연평균 수익률
+                  ÷ |MDD|(최대낙폭의 절댓값). &quot;역대 최악의 하락 한 번&quot; 대비 얼마나
+                  버는지를 보여주는 가장 단순한 지표입니다. 예: 연 18% 수익에 MDD -30%면 칼마
+                  0.6.
+                </li>
+                <li>
+                  세 지표 모두 <span className="font-semibold text-zinc-300">높을수록 좋고</span>,
+                  가격이 거의 변하지 않아 변동성이 사실상 0에 가까우면 계산할 수 없어
+                  &quot;-&quot;로 표시됩니다.
+                </li>
+              </ul>
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-180 text-[11.5px]">
+                  <thead>
+                    <tr className="text-left text-muted">
+                      <th className="py-1 pr-3 font-medium">비중 구성</th>
+                      <th className="py-1 pr-3 font-medium">수익률</th>
+                      <th className="py-1 pr-3 font-medium">
+                        {riskMode === "lumpsum" ? "MDD" : "평균 최대낙폭"}
+                      </th>
+                      {riskMode === "rolling" && (
+                        <th className="py-1 pr-3 font-medium">수익 구간</th>
+                      )}
+                      <th className="py-1 pr-3 font-medium" title="(연평균수익률-무위험수익률)÷변동성">
+                        샤프
+                      </th>
+                      <th
+                        className="py-1 pr-3 font-medium"
+                        title="(연평균수익률-무위험수익률)÷하락변동성"
+                      >
+                        소르티노
+                      </th>
+                      <th className="py-1 pr-3 font-medium" title="연평균수익률÷|MDD|">
+                        칼마
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {paretoCombos.map((p) => (
+                      <tr key={p.label} className="border-t border-[#25253f]">
+                        <td className="py-1.5 pr-3 font-sans text-zinc-300">{p.label}</td>
+                        <td className="py-1.5 pr-3 text-green">{p.returnPct.toFixed(2)}%</td>
+                        <td className="py-1.5 pr-3 text-red">{p.mddPct.toFixed(2)}%</td>
+                        {riskMode === "rolling" && (
+                          <td className="py-1.5 pr-3 text-zinc-300">
+                            {p.totalCount != null && p.positiveCount != null
+                              ? `${p.positiveCount}/${p.totalCount} (${
+                                  p.totalCount > 0
+                                    ? ((p.positiveCount / p.totalCount) * 100).toFixed(0)
+                                    : 0
+                                }%)`
+                              : "-"}
+                          </td>
+                        )}
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {p.sharpe == null ? "-" : p.sharpe.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {p.sortino == null ? "-" : p.sortino.toFixed(2)}
+                        </td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {p.calmar == null ? "-" : p.calmar.toFixed(2)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {correlationMatrix && (
+            <div className="overflow-x-auto border-t border-border p-3">
+              <div className="mb-1 text-[11px] text-muted">
+                종목간 상관관계 — 일별 수익률 기준 피어슨 상관계수(-1~1). 낮거나 음수일수록
+                같이 움직이지 않는다는 뜻이라 분산투자 효과가 큽니다.
+              </div>
+              <ul className="mb-2 list-inside list-disc space-y-0.5 pl-0.5 text-[11px] text-muted marker:text-zinc-600">
+                <li>
+                  <span className="font-semibold text-green">낮음(0 이하)</span> — 서로 반대
+                  또는 무관하게 움직임. 같이 담으면 변동성이 줄어드는 효과가 큽니다.
+                </li>
+                <li>
+                  <span className="font-semibold text-zinc-300">중간(0~0.5)</span> — 어느 정도
+                  같이 움직이지만 분산 효과가 아직 남아있습니다.
+                </li>
+                <li>
+                  <span className="font-semibold text-red">높음(0.5 이상)</span> — 거의 같이
+                  움직여서 두 종목을 같이 담아도 분산투자 효과가 작습니다.
+                </li>
+              </ul>
+              <table className="w-full max-w-160 text-[11.5px]">
                 <thead>
                   <tr className="text-left text-muted">
-                    <th className="py-1 pr-3 font-medium">비중 구성</th>
-                    <th className="py-1 pr-3 font-medium">수익률</th>
-                    <th className="py-1 pr-3 font-medium">
-                      {riskMode === "lumpsum" ? "MDD" : "평균 최대낙폭"}
-                    </th>
-                    {riskMode === "rolling" && (
-                      <th className="py-1 pr-3 font-medium">수익 구간</th>
-                    )}
+                    <th className="py-1 pr-3 font-medium"></th>
+                    {correlationMatrix.tickers.map((t) => (
+                      <th key={t.id} className="py-1 pr-3 text-center font-medium">
+                        {t.label}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody className="font-mono">
-                  {paretoCombos.map((p) => (
-                    <tr key={p.label} className="border-t border-[#25253f]">
-                      <td className="py-1.5 pr-3 font-sans text-zinc-300">{p.label}</td>
-                      <td className="py-1.5 pr-3 text-green">{p.returnPct.toFixed(2)}%</td>
-                      <td className="py-1.5 pr-3 text-red">{p.mddPct.toFixed(2)}%</td>
-                      {riskMode === "rolling" && (
-                        <td className="py-1.5 pr-3 text-zinc-300">
-                          {p.totalCount != null && p.positiveCount != null
-                            ? `${p.positiveCount}/${p.totalCount} (${
-                                p.totalCount > 0
-                                  ? ((p.positiveCount / p.totalCount) * 100).toFixed(0)
-                                  : 0
-                              }%)`
-                            : "-"}
+                  {correlationMatrix.tickers.map((rowTicker, i) => (
+                    <tr key={rowTicker.id} className="border-t border-[#25253f]">
+                      <td className="py-1.5 pr-3 font-sans font-semibold text-zinc-300">
+                        {rowTicker.label}
+                      </td>
+                      {correlationMatrix.matrix[i].map((value, j) => (
+                        <td
+                          key={correlationMatrix.tickers[j].id}
+                          className={`py-1.5 pr-3 text-center ${
+                            value == null
+                              ? "text-muted"
+                              : i === j
+                                ? "text-zinc-500"
+                                : value <= 0
+                                  ? "text-green"
+                                  : value < 0.5
+                                    ? "text-zinc-300"
+                                    : "text-red"
+                          }`}
+                        >
+                          {value == null ? "-" : value.toFixed(2)}
                         </td>
-                      )}
+                      ))}
                     </tr>
                   ))}
                 </tbody>
@@ -1354,7 +1789,11 @@ export function PortfolioChart({
               </span>
               <span className="flex items-center gap-1">
                 <span className="h-2 w-2 rounded-full" style={{ background: PARETO_COLOR }} />
-                비율 이탈 시 리밸런싱
+                비율 이탈 시 리밸런싱 (고정 10%p)
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="h-2 w-2 rounded-full" style={{ background: DCA_REBAL_COLOR }} />
+                변동성 기준 리밸런싱
               </span>
               <span className="flex items-center gap-1">
                 <span className="h-3 w-0.5" style={{ background: "rgba(231, 76, 60, 0.85)" }} />
@@ -1372,6 +1811,15 @@ export function PortfolioChart({
               초기화
             </button>
           </div>
+          {dcaVolatilityThresholds.length > 0 && (
+            <div className="border-b border-border px-3 py-1.5 text-[11px] text-muted">
+              변동성 기준 밴드 — 변동성이 큰 종목일수록 밴드를 넓혀(불필요한 리밸런싱 방지), 낮은
+              종목일수록 좁혀서(작은 이탈도 포착) 종목마다 다른 기준을 적용합니다:{" "}
+              {dcaVolatilityThresholds
+                .map((t) => `${t.label} ±${t.thresholdPct.toFixed(1)}%p`)
+                .join(" · ")}
+            </div>
+          )}
           <div className="relative min-h-80 flex-1 p-3">
             <canvas ref={dcaCanvasRef} />
             {dcaEmpty && (
@@ -1389,21 +1837,27 @@ export function PortfolioChart({
                     <th className="py-1 pr-3 font-medium">투자원금</th>
                     <th className="py-1 pr-3 font-medium">최종 평가액</th>
                     <th className="py-1 pr-3 font-medium">수익률</th>
+                    <th className="py-1 pr-3 font-medium">연평균 수익률</th>
                     <th className="py-1 pr-3 font-medium">MDD</th>
                     <th className="py-1 pr-3 font-medium">-20% 이하 하락 횟수</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono">
                   {dcaSummary.map((s) => (
-                    <tr key={s.rebalanced ? "rebal" : "no-rebal"} className="border-t border-[#25253f]">
-                      <td className="py-1.5 pr-3 font-sans text-zinc-300">
-                        {s.rebalanced ? "비율 이탈 시 리밸런싱" : "리밸런싱 없음"}
-                      </td>
+                    <tr key={s.key} className="border-t border-[#25253f]">
+                      <td className="py-1.5 pr-3 font-sans text-zinc-300">{s.label}</td>
                       <td className="py-1.5 pr-3 text-zinc-300">{s.invested.toLocaleString()}</td>
                       <td className="py-1.5 pr-3 text-zinc-300">{s.finalValue.toLocaleString()}</td>
                       <td className={`py-1.5 pr-3 ${s.returnPct >= 0 ? "text-green" : "text-red"}`}>
                         {s.returnPct >= 0 ? "+" : ""}
                         {s.returnPct.toFixed(2)}%
+                      </td>
+                      <td
+                        className={`py-1.5 pr-3 ${(s.annualizedReturnPct ?? 0) >= 0 ? "text-green" : "text-red"}`}
+                      >
+                        {s.annualizedReturnPct == null
+                          ? "-"
+                          : `${s.annualizedReturnPct >= 0 ? "+" : ""}${s.annualizedReturnPct.toFixed(2)}%`}
                       </td>
                       <td className="py-1.5 pr-3 text-red">{s.mddPct.toFixed(2)}%</td>
                       <td className="py-1.5 pr-3 text-zinc-300">
@@ -1415,12 +1869,21 @@ export function PortfolioChart({
                   ))}
                 </tbody>
               </table>
-              {dcaSummary.length === 2 && (
-                <div className="mt-2 text-[11px] text-muted">
-                  MDD 차이: {(dcaSummary[1].mddPct - dcaSummary[0].mddPct).toFixed(2)}%p (리밸런싱
-                  {dcaSummary[1].mddPct > dcaSummary[0].mddPct ? " 시 낙폭이 더 큼" : " 시 낙폭이 더 작음"}) ·
-                  -20% 이하 하락 횟수 차이:{" "}
-                  {dcaSummary[1].deepDrawdowns.length - dcaSummary[0].deepDrawdowns.length}회
+              {dcaSummary.length > 1 && (
+                <div className="mt-2 space-y-0.5 text-[11px] text-muted">
+                  {dcaSummary.slice(1).map((s) => {
+                    const base = dcaSummary[0];
+                    const mddDiff = s.mddPct - base.mddPct;
+                    const countDiff = s.deepDrawdowns.length - base.deepDrawdowns.length;
+                    return (
+                      <div key={s.key}>
+                        {s.label} vs {base.label} — MDD 차이: {mddDiff.toFixed(2)}%p (
+                        {mddDiff > 0 ? "낙폭이 더 큼" : mddDiff < 0 ? "낙폭이 더 작음" : "동일"}) ·
+                        -20% 이하 하락 횟수 차이: {countDiff > 0 ? "+" : ""}
+                        {countDiff}회
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -1428,7 +1891,8 @@ export function PortfolioChart({
           {dcaEvents.length > 0 && (
             <div className="overflow-x-auto border-t border-border p-3">
               <div className="mb-2 text-[11px] text-muted">
-                리밸런싱 이력 (실제 비중이 10%p 구간을 넘어갈 때마다 목표 비중으로 재조정)
+                고정 10%p 리밸런싱 이력 (실제 비중이 10%p 구간을 넘어갈 때마다 목표 비중으로
+                재조정)
               </div>
               <div className="max-h-64 overflow-y-auto">
                 <table className="w-full min-w-100 text-[11.5px]">
@@ -1441,6 +1905,38 @@ export function PortfolioChart({
                   </thead>
                   <tbody className="font-mono">
                     {dcaEvents.map((e) => (
+                      <tr key={e.date} className="border-t border-[#25253f]">
+                        <td className="py-1.5 pr-3 text-zinc-300">{e.date}</td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {e.tickerLabels.map((label, i) => `${label} ${e.beforeRatio[i]}%`).join(" · ")}
+                        </td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {e.tickerLabels.map((label, i) => `${label} ${e.afterRatio[i]}%`).join(" · ")}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {dcaVolatilityEvents.length > 0 && (
+            <div className="overflow-x-auto border-t border-border p-3">
+              <div className="mb-2 text-[11px] text-muted">
+                변동성 기준 리밸런싱 이력 (종목마다 다른 밴드를 넘어갈 때마다 목표 비중으로
+                재조정)
+              </div>
+              <div className="max-h-64 overflow-y-auto">
+                <table className="w-full min-w-100 text-[11.5px]">
+                  <thead className="sticky top-0 bg-surface">
+                    <tr className="text-left text-muted">
+                      <th className="py-1 pr-3 font-medium">날짜</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 전</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 후</th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {dcaVolatilityEvents.map((e) => (
                       <tr key={e.date} className="border-t border-[#25253f]">
                         <td className="py-1.5 pr-3 text-zinc-300">{e.date}</td>
                         <td className="py-1.5 pr-3 text-zinc-300">
@@ -1473,32 +1969,6 @@ export function PortfolioChart({
               />
               %
             </span>
-            <span className="flex items-center gap-1.5">
-              트리거1
-              <input
-                type="number"
-                min={-90}
-                max={-1}
-                step={5}
-                value={trigger1Input}
-                onChange={(e) => setTrigger1Input(e.target.value)}
-                className="h-6 w-14 rounded border border-border bg-surface-2 px-1.5 text-center font-mono text-[11.5px] text-foreground outline-none focus:border-blue"
-              />
-              %
-            </span>
-            <span className="flex items-center gap-1.5">
-              트리거2
-              <input
-                type="number"
-                min={-95}
-                max={-1}
-                step={5}
-                value={trigger2Input}
-                onChange={(e) => setTrigger2Input(e.target.value)}
-                className="h-6 w-14 rounded border border-border bg-surface-2 px-1.5 text-center font-mono text-[11.5px] text-foreground outline-none focus:border-blue"
-              />
-              %
-            </span>
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
             <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted">
@@ -1514,9 +1984,29 @@ export function PortfolioChart({
                 <span className="h-2 w-2 rounded-full" style={{ background: PARETO_COLOR }} />
                 현금버퍼 총자산
               </span>
+              <span className="flex items-center gap-1">
+                <span className="h-2 w-2 rounded-full" style={{ background: CASH_COLOR }} />
+                순수 현금 보유액
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="h-2 w-2 rounded-full" style={{ background: DCA_REBAL_COLOR }} />
+                DCA (현금보유+리밸런싱)
+              </span>
+              <span className="flex items-center gap-1">
+                <span
+                  className="h-2 w-2 rounded-full"
+                  style={{ background: CURRENT_COMBO_COLOR }}
+                />
+                현금⇄주식 리밸런싱 시점
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="h-2 w-2 rounded-full" style={{ background: STOCK_REBAL_COLOR }} />
+                종목간 리밸런싱 시점
+              </span>
               <span>
-                · 매월 투입액 중 현금비율만큼은 보류했다가, 고점 대비 낙폭이 트리거에 닿을 때마다
-                남은 현금을 나눠 투입합니다. 신고점 갱신 시 트리거가 다시 무장됩니다.
+                · 매월 투입액 중 현금비율만큼은 현금으로 보유합니다. 현금:주식 비중과 종목간
+                비중을 각각 독립적으로 - 목표 대비 10%p 이상 벗어나면 - 재조정합니다 (두 비율 모두
+                항상 자기 안에서 합계 100%).
               </span>
             </div>
             <button
@@ -1543,6 +2033,7 @@ export function PortfolioChart({
                     <th className="py-1 pr-3 font-medium">투자원금</th>
                     <th className="py-1 pr-3 font-medium">최종 평가액</th>
                     <th className="py-1 pr-3 font-medium">수익률</th>
+                    <th className="py-1 pr-3 font-medium">연평균 수익률</th>
                     <th className="py-1 pr-3 font-medium">MDD</th>
                   </tr>
                 </thead>
@@ -1556,6 +2047,13 @@ export function PortfolioChart({
                         {s.returnPct >= 0 ? "+" : ""}
                         {s.returnPct.toFixed(2)}%
                       </td>
+                      <td
+                        className={`py-1.5 pr-3 ${(s.annualizedReturnPct ?? 0) >= 0 ? "text-green" : "text-red"}`}
+                      >
+                        {s.annualizedReturnPct == null
+                          ? "-"
+                          : `${s.annualizedReturnPct >= 0 ? "+" : ""}${s.annualizedReturnPct.toFixed(2)}%`}
+                      </td>
                       <td className="py-1.5 pr-3 text-red">{s.mddPct.toFixed(2)}%</td>
                     </tr>
                   ))}
@@ -1563,30 +2061,120 @@ export function PortfolioChart({
               </table>
             </div>
           )}
-          {cashBufferEvents.length > 0 && (
+          {cashBufferEvents.some((e) => e.level === "cash") && (
             <div className="overflow-x-auto border-t border-border p-3">
-              <div className="mb-2 text-[11px] text-muted">
-                현금 투입 이력 (낙폭이 트리거에 닿을 때마다 남은 현금 풀 중 일부를 투입)
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: CURRENT_COMBO_COLOR }}
+                />
+                현금⇄주식 리밸런싱 이력 (현금 비중이 목표 대비 10%p 이상 벗어날 때마다 재조정 -
+                항상 현금%+주식%=100)
               </div>
               <div className="max-h-64 overflow-y-auto">
                 <table className="w-full min-w-100 text-[11.5px]">
                   <thead className="sticky top-0 bg-surface">
                     <tr className="text-left text-muted">
                       <th className="py-1 pr-3 font-medium">날짜</th>
-                      <th className="py-1 pr-3 font-medium">트리거</th>
-                      <th className="py-1 pr-3 font-medium">당시 낙폭</th>
-                      <th className="py-1 pr-3 font-medium">투입액</th>
-                      <th className="py-1 pr-3 font-medium">투입 후 잔여 현금</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 전</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 후</th>
                     </tr>
                   </thead>
                   <tbody className="font-mono">
-                    {cashBufferEvents.map((e, i) => (
+                    {cashBufferEvents
+                      .filter((e) => e.level === "cash")
+                      .map((e, i) => (
+                        <tr key={`${e.date}-${i}`} className="border-t border-[#25253f]">
+                          <td className="py-1.5 pr-3 text-zinc-300">{e.date}</td>
+                          <td className="py-1.5 pr-3 text-zinc-300">
+                            {["현금", "주식"]
+                              .map((label, i2) => `${label} ${e.beforeRatio[i2]}%`)
+                              .join(" · ")}
+                          </td>
+                          <td className="py-1.5 pr-3 text-zinc-300">
+                            {["현금", "주식"]
+                              .map((label, i2) => `${label} ${e.afterRatio[i2]}%`)
+                              .join(" · ")}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {cashBufferEvents.some((e) => e.level === "stock") && (
+            <div className="overflow-x-auto border-t border-border p-3">
+              <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: STOCK_REBAL_COLOR }}
+                />
+                종목간 리밸런싱 이력 (주식 안에서 종목 비중이 목표 대비 10%p 이상 벗어날 때마다
+                재조정 - 항상 종목 비중 합계 100%, 현금은 무관)
+              </div>
+              <div className="max-h-64 overflow-y-auto">
+                <table className="w-full min-w-100 text-[11.5px]">
+                  <thead className="sticky top-0 bg-surface">
+                    <tr className="text-left text-muted">
+                      <th className="py-1 pr-3 font-medium">날짜</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 전</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 후</th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {cashBufferEvents
+                      .filter((e) => e.level === "stock")
+                      .map((e, i) => (
+                        <tr key={`${e.date}-${i}`} className="border-t border-[#25253f]">
+                          <td className="py-1.5 pr-3 text-zinc-300">{e.date}</td>
+                          <td className="py-1.5 pr-3 text-zinc-300">
+                            {e.tickerLabels
+                              .map((label, i2) => `${label} ${e.beforeRatio[i2]}%`)
+                              .join(" · ")}
+                          </td>
+                          <td className="py-1.5 pr-3 text-zinc-300">
+                            {e.tickerLabels
+                              .map((label, i2) => `${label} ${e.afterRatio[i2]}%`)
+                              .join(" · ")}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {cashBufferDcaEvents.length > 0 && (
+            <div className="overflow-x-auto border-t border-border p-3">
+              <div className="mb-2 text-[11px] text-muted">
+                DCA (현금보유+리밸런싱) 리밸런싱 이력 (현금비율만큼은 매월 그대로 보유하고, 나머지
+                투자금 안에서 종목 비중이 목표 대비 10%p 이상 벗어날 때마다 종목 간 비율만
+                재조정 - 현금 자체는 재조정 대상 아님)
+              </div>
+              <div className="max-h-64 overflow-y-auto">
+                <table className="w-full min-w-100 text-[11.5px]">
+                  <thead className="sticky top-0 bg-surface">
+                    <tr className="text-left text-muted">
+                      <th className="py-1 pr-3 font-medium">날짜</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 전</th>
+                      <th className="py-1 pr-3 font-medium">리밸런싱 후</th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {cashBufferDcaEvents.map((e, i) => (
                       <tr key={`${e.date}-${i}`} className="border-t border-[#25253f]">
                         <td className="py-1.5 pr-3 text-zinc-300">{e.date}</td>
-                        <td className="py-1.5 pr-3 text-red">{(e.triggerLevel * 100).toFixed(0)}%</td>
-                        <td className="py-1.5 pr-3 text-red">{(e.drawdown * 100).toFixed(1)}%</td>
-                        <td className="py-1.5 pr-3 text-zinc-300">{e.deployAmount.toLocaleString()}</td>
-                        <td className="py-1.5 pr-3 text-zinc-300">{e.cashPoolAfter.toLocaleString()}</td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {e.tickerLabels
+                            .map((label, i2) => `${label} ${e.beforeRatio[i2]}%`)
+                            .join(" · ")}
+                        </td>
+                        <td className="py-1.5 pr-3 text-zinc-300">
+                          {e.tickerLabels
+                            .map((label, i2) => `${label} ${e.afterRatio[i2]}%`)
+                            .join(" · ")}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

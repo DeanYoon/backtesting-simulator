@@ -8,69 +8,60 @@ export type CashBufferPoint = {
   invested: number;
 };
 
-export type CashDeployEvent = {
+export type CashRebalanceEvent = {
   date: string;
-  triggerLevel: number; // negative fraction, e.g. -0.15
-  drawdown: number; // negative fraction, actual drawdown at trigger time
-  deployAmount: number;
-  cashPoolAfter: number;
+  // "cash": rebalances cash vs the stock sleeve as a whole. beforeRatio /
+  // afterRatio are always [현금%, 주식%], summing to 100 on their own.
+  // "stock": rebalances tickers against each other WITHIN the stock sleeve
+  // only. beforeRatio / afterRatio are one entry per ticker, each ticker's
+  // share of the stock sleeve (not of the whole pool), summing to 100 on
+  // their own.
+  // The two levels are checked and corrected independently so neither ever
+  // has to blend cash and ticker weights into one combined (and often
+  // non-round) percentage.
+  level: "cash" | "stock";
+  beforeRatio: number[];
+  afterRatio: number[];
 };
 
-export type CashBufferResult = { points: CashBufferPoint[]; events: CashDeployEvent[] };
+export type CashBufferResult = { points: CashBufferPoint[]; events: CashRebalanceEvent[] };
 
-// Tactical "buy the dip" variant of DCA: each month, only `1 - cashRatio` of
-// the contribution is invested immediately — the rest sits in an idle cash
-// pool. Whenever the underlying (weighted) market index makes a new all-time
-// high, every trigger level is re-armed. As the index falls through each
-// trigger level (sorted shallowest first), that fraction of the remaining
-// cash pool gets deployed at the current price, so the pool empties out
-// gradually across the defined levels rather than all at once. Each deploy
-// is recorded as a CashDeployEvent.
+// Both levels fire on the same 10 percentage-point drift threshold (matching
+// DCA's own threshold-rebalance rule).
+const DRIFT_THRESHOLD_PCT = 10;
+
 export function simulateCashBuffer(
   tickerSeries: { ticker: string; data: SeriesPoint[] }[],
   weights: Record<string, number>,
-  options: {
-    monthlyAmount?: number;
-    cashRatio?: number;
-    triggerLevels?: number[]; // negative fractions, e.g. [-0.15, -0.25]
-  } = {},
+  options: { monthlyAmount?: number; cashRatio?: number } = {},
 ): CashBufferResult {
   if (tickerSeries.length === 0) return { points: [], events: [] };
 
   const monthlyAmount = options.monthlyAmount ?? 100;
-  const cashRatio = Math.min(1, Math.max(0, options.cashRatio ?? 0.2));
-  const triggerLevels = [...(options.triggerLevels ?? [-0.15, -0.25])].sort((a, b) => b - a);
+  const targetCashRatio = Math.min(1, Math.max(0, options.cashRatio ?? 0.2));
 
   const totalWeight = tickerSeries.reduce((sum, t) => sum + (weights[t.ticker] ?? 0), 0);
   if (totalWeight <= 0) return { points: [], events: [] };
   const normalizedWeights = tickerSeries.map((t) => (weights[t.ticker] ?? 0) / totalWeight);
+  const targetTickerPct = normalizedWeights.map((w) => w * 100);
 
   const dates = tickerSeries[0].data.map((d) => d.date);
   const prices = tickerSeries.map((t) => t.data.map((d) => d.value));
   const n = dates.length;
 
-  const marketIndex = dates.map((_, i) => {
-    let v = 0;
-    for (let j = 0; j < tickerSeries.length; j++) v += prices[j][i] * normalizedWeights[j];
-    return v;
-  });
-
   const shares = new Array(tickerSeries.length).fill(0);
-  const fired = new Array(triggerLevels.length).fill(false);
   let cashPool = 0;
   let invested = 0;
   let lastMonthKey = "";
-  let runningMax = marketIndex[0];
 
-  function invest(amount: number, i: number) {
-    for (let j = 0; j < tickerSeries.length; j++) {
-      const price = prices[j][i];
-      if (price > 0) shares[j] += (normalizedWeights[j] * amount) / price;
-    }
+  function investedValueAt(i: number) {
+    let v = 0;
+    for (let j = 0; j < tickerSeries.length; j++) v += shares[j] * prices[j][i];
+    return v;
   }
 
   const points: CashBufferPoint[] = [];
-  const events: CashDeployEvent[] = [];
+  const events: CashRebalanceEvent[] = [];
 
   for (let i = 0; i < n; i++) {
     const date = dates[i];
@@ -79,37 +70,86 @@ export function simulateCashBuffer(
     if (monthKey !== lastMonthKey) {
       lastMonthKey = monthKey;
       invested += monthlyAmount;
-      invest(monthlyAmount * (1 - cashRatio), i);
-      cashPool += monthlyAmount * cashRatio;
-    }
-
-    if (marketIndex[i] > runningMax) {
-      runningMax = marketIndex[i];
-      fired.fill(false);
-    }
-
-    const drawdown = runningMax > 0 ? (marketIndex[i] - runningMax) / runningMax : 0;
-
-    for (let k = 0; k < triggerLevels.length; k++) {
-      if (!fired[k] && drawdown <= triggerLevels[k]) {
-        fired[k] = true;
-        const remaining = triggerLevels.length - k;
-        const deployAmount = cashPool / remaining;
-        invest(deployAmount, i);
-        cashPool -= deployAmount;
-        events.push({
-          date,
-          triggerLevel: triggerLevels[k],
-          drawdown,
-          deployAmount: Math.round(deployAmount),
-          cashPoolAfter: Math.round(cashPool),
-        });
+      cashPool += monthlyAmount * targetCashRatio;
+      for (let j = 0; j < tickerSeries.length; j++) {
+        const price = prices[j][i];
+        if (price > 0) {
+          shares[j] += (normalizedWeights[j] * monthlyAmount * (1 - targetCashRatio)) / price;
+        }
       }
     }
 
-    let investedValue = 0;
-    for (let j = 0; j < tickerSeries.length; j++) investedValue += shares[j] * prices[j][i];
+    // Level 1: cash vs the stock sleeve as a whole. Buys/sells stock
+    // proportionally across tickers by their CURRENT relative weight, so
+    // this never disturbs the ticker-vs-ticker balance checked below.
+    {
+      const investedValue = investedValueAt(i);
+      const totalValue = investedValue + cashPool;
+      if (totalValue > 0) {
+        const cashPct = (cashPool / totalValue) * 100;
+        const targetCashPct = targetCashRatio * 100;
+        if (Math.abs(cashPct - targetCashPct) >= DRIFT_THRESHOLD_PCT - 1e-9) {
+          const diff = totalValue * targetCashRatio - cashPool;
+          if (investedValue > 0 && Math.abs(diff) > 1e-6) {
+            if (diff > 0) {
+              const fraction = Math.min(1, diff / investedValue);
+              for (let j = 0; j < tickerSeries.length; j++) shares[j] *= 1 - fraction;
+              cashPool += diff;
+            } else {
+              const buyAmount = Math.min(-diff, cashPool);
+              for (let j = 0; j < tickerSeries.length; j++) {
+                const price = prices[j][i];
+                const currentTickerValue = shares[j] * price;
+                if (price > 0) {
+                  shares[j] += ((currentTickerValue / investedValue) * buyAmount) / price;
+                }
+              }
+              cashPool -= buyAmount;
+            }
+            events.push({
+              date,
+              level: "cash",
+              beforeRatio: [
+                Math.round(cashPct * 10) / 10,
+                Math.round((100 - cashPct) * 10) / 10,
+              ],
+              afterRatio: [
+                Math.round(targetCashPct * 10) / 10,
+                Math.round((100 - targetCashPct) * 10) / 10,
+              ],
+            });
+          }
+        }
+      }
+    }
 
+    // Level 2: ticker vs ticker, within the stock sleeve only - cash is
+    // never touched here.
+    {
+      const investedValue = investedValueAt(i);
+      if (investedValue > 0) {
+        const currentTickerPct = shares.map(
+          (sh, j) => ((sh * prices[j][i]) / investedValue) * 100,
+        );
+        const drifted = currentTickerPct.some(
+          (pct, j) => Math.abs(pct - targetTickerPct[j]) >= DRIFT_THRESHOLD_PCT - 1e-9,
+        );
+        if (drifted) {
+          events.push({
+            date,
+            level: "stock",
+            beforeRatio: currentTickerPct.map((pct) => Math.round(pct * 10) / 10),
+            afterRatio: targetTickerPct.map((pct) => Math.round(pct * 10) / 10),
+          });
+          for (let j = 0; j < tickerSeries.length; j++) {
+            const price = prices[j][i];
+            if (price > 0) shares[j] = (normalizedWeights[j] * investedValue) / price;
+          }
+        }
+      }
+    }
+
+    const investedValue = investedValueAt(i);
     points.push({
       date,
       investedValue: Math.round(investedValue),

@@ -161,3 +161,100 @@ export function findParetoFrontier(
     }),
   );
 }
+
+const TRADING_DAYS_PER_YEAR = 252;
+// Below this, a stdev is treated as zero (avoids blowing up into a huge,
+// meaningless ratio from floating-point noise on an effectively-constant
+// return series).
+const STDEV_EPSILON = 1e-9;
+
+function computeDailyReturns(data: SeriesPoint[]): number[] {
+  const returns: number[] = [];
+  for (let i = 1; i < data.length; i++) {
+    const prev = data[i - 1].value;
+    if (prev > 0) returns.push(data[i].value / prev - 1);
+  }
+  return returns;
+}
+
+// Annualized Sharpe ratio: excess return over the (default 0%) risk-free
+// rate, divided by the volatility of daily returns.
+export function computeSharpeRatio(data: SeriesPoint[], riskFreeRateAnnual = 0): number | null {
+  const returns = computeDailyReturns(data);
+  if (returns.length < 2) return null;
+  const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  const variance =
+    returns.reduce((sum, r) => sum + (r - mean) ** 2, 0) / (returns.length - 1);
+  const stdev = Math.sqrt(variance);
+  if (stdev < STDEV_EPSILON) return null;
+  const dailyRiskFree = riskFreeRateAnnual / TRADING_DAYS_PER_YEAR;
+  return ((mean - dailyRiskFree) / stdev) * Math.sqrt(TRADING_DAYS_PER_YEAR);
+}
+
+// Annualized Sortino ratio: like Sharpe, but only downside deviation
+// (returns below the risk-free/target rate) counts against it - a combo
+// that's volatile only on the upside isn't penalized.
+export function computeSortinoRatio(data: SeriesPoint[], riskFreeRateAnnual = 0): number | null {
+  const returns = computeDailyReturns(data);
+  if (returns.length < 2) return null;
+  const dailyRiskFree = riskFreeRateAnnual / TRADING_DAYS_PER_YEAR;
+  const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  const downsideVariance =
+    returns.reduce((sum, r) => sum + Math.min(0, r - dailyRiskFree) ** 2, 0) / returns.length;
+  const downsideDev = Math.sqrt(downsideVariance);
+  if (downsideDev < STDEV_EPSILON) return null;
+  return ((mean - dailyRiskFree) / downsideDev) * Math.sqrt(TRADING_DAYS_PER_YEAR);
+}
+
+// Calmar ratio: annualized return divided by the magnitude of max drawdown
+// (both as fractions, e.g. 0.18 and -0.30 -> 0.6). Higher is better - more
+// return earned per unit of worst-case pain.
+export function computeCalmarRatio(
+  annualizedReturnFraction: number,
+  mddFraction: number,
+): number | null {
+  if (mddFraction === 0) return null;
+  return annualizedReturnFraction / Math.abs(mddFraction);
+}
+
+// Pearson correlation coefficient between two assets' daily returns, in
+// [-1, 1]. +1 = always move together, -1 = always move oppositely, 0 = no
+// linear relationship - the lower (or more negative), the more diversification
+// benefit from holding both.
+export function computePearsonCorrelation(a: SeriesPoint[], b: SeriesPoint[]): number | null {
+  const returnsA = computeDailyReturns(a);
+  const returnsB = computeDailyReturns(b);
+  const n = Math.min(returnsA.length, returnsB.length);
+  if (n < 2) return null;
+
+  const meanA = returnsA.slice(0, n).reduce((sum, r) => sum + r, 0) / n;
+  const meanB = returnsB.slice(0, n).reduce((sum, r) => sum + r, 0) / n;
+
+  let covariance = 0;
+  let varianceA = 0;
+  let varianceB = 0;
+  for (let i = 0; i < n; i++) {
+    const da = returnsA[i] - meanA;
+    const db = returnsB[i] - meanB;
+    covariance += da * db;
+    varianceA += da * da;
+    varianceB += db * db;
+  }
+  if (varianceA < STDEV_EPSILON || varianceB < STDEV_EPSILON) return null;
+  return covariance / Math.sqrt(varianceA * varianceB);
+}
+
+// Annualized volatility (stdev of daily returns, scaled by sqrt(252)) - the
+// same volatility figure used to size Sharpe/Sortino's denominator, exposed
+// standalone so other logic (e.g. volatility-scaled rebalance bands) can
+// reuse it without recomputing Sharpe.
+export function computeAnnualizedVolatility(data: SeriesPoint[]): number | null {
+  const returns = computeDailyReturns(data);
+  if (returns.length < 2) return null;
+  const mean = returns.reduce((sum, r) => sum + r, 0) / returns.length;
+  const variance =
+    returns.reduce((sum, r) => sum + (r - mean) ** 2, 0) / (returns.length - 1);
+  const stdev = Math.sqrt(variance);
+  if (stdev < STDEV_EPSILON) return null;
+  return stdev * Math.sqrt(TRADING_DAYS_PER_YEAR);
+}
