@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { TickerSearch } from "@/app/components/TickerSearch";
 import { LocalFundPicker } from "@/app/components/LocalFundPicker";
@@ -236,6 +236,16 @@ export default function Home() {
     setAssets((prev) => prev.filter((a) => a.id !== id));
   }
 
+  // Clicking a point in the risk-return scatter applies that combo's
+  // weights straight to the sliders (matched by ticker, same as `weights`).
+  // Stable reference (like `weights`) so PortfolioChart's risk-tab effect
+  // doesn't rebuild the chart on unrelated re-renders.
+  const handleApplyWeights = useCallback((tickerWeights: Record<string, number>) => {
+    setAssets((prev) =>
+      prev.map((a) => (a.ticker in tickerWeights ? { ...a, weight: tickerWeights[a.ticker] } : a)),
+    );
+  }, []);
+
   return (
     <div className="mx-auto flex w-full max-w-400 flex-col gap-4 px-5 py-5 lg:flex-row lg:items-start">
       <div className="flex w-full flex-col gap-3 lg:w-95 lg:shrink-0">
@@ -270,6 +280,7 @@ export default function Home() {
           displayCurrency={displayCurrency}
           onCurrencyChange={handleCurrencyChange}
           currencyLoading={currencyLoading}
+          onApplyWeights={handleApplyWeights}
         />
       </div>
     </div>

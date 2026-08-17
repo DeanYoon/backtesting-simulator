@@ -219,12 +219,14 @@ export function PortfolioChart({
   displayCurrency,
   onCurrencyChange,
   currencyLoading,
+  onApplyWeights,
 }: {
   series: ChartSeries[];
   weights?: Record<string, number>;
   displayCurrency?: Currency;
   onCurrencyChange?: (currency: Currency) => void;
   currencyLoading?: boolean;
+  onApplyWeights?: (weights: Record<string, number>) => void;
 }) {
   const [activeTab, setActiveTab] = useState<Tab>("growth");
   const growthCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -673,6 +675,19 @@ export function PortfolioChart({
         responsive: true,
         maintainAspectRatio: false,
         interaction: { mode: "nearest", intersect: true },
+        onClick: (_event, elements) => {
+          if (elements.length === 0 || !onApplyWeights) return;
+          const { datasetIndex, index } = elements[0];
+          const detail = riskDetailRef.current.get(`${datasetIndex}:${index}`);
+          if (!detail) return;
+          onApplyWeights(
+            Object.fromEntries(tickerSeries.map((t, i) => [t.id, detail.weights[i]])),
+          );
+        },
+        onHover: (event, elements) => {
+          const target = event.native?.target as HTMLElement | undefined;
+          if (target) target.style.cursor = elements.length > 0 && onApplyWeights ? "pointer" : "default";
+        },
         scales: {
           x: {
             type: "linear",
@@ -748,7 +763,7 @@ export function PortfolioChart({
       riskChartRef.current?.destroy();
       riskChartRef.current = null;
     };
-  }, [series, activeTab, holdingYears, riskMode, weights]);
+  }, [series, activeTab, holdingYears, riskMode, weights, onApplyWeights]);
 
   // DCA (dollar-cost-averaging) growth curve: simulate buying in fixed
   // monthly amounts at the current target weights, with and without
@@ -1611,7 +1626,8 @@ export function PortfolioChart({
               ·{" "}
               {riskMode === "lumpsum"
                 ? "종목 비중을 10%p 단위로 모두 조합해, 맨 처음 일시투자해서 마지막 날까지 들고 있었다면의 누적수익과 위험(MDD)을 비교합니다."
-                : "종목 비중을 10%p 단위로 모두 조합해, 각 보유기간 구간에서 겪은 최대낙폭의 평균 대비 평균 수익을 비교합니다."}
+                : "종목 비중을 10%p 단위로 모두 조합해, 각 보유기간 구간에서 겪은 최대낙폭의 평균 대비 평균 수익을 비교합니다."}{" "}
+              점을 클릭하면 그 비중이 왼쪽 슬라이더에 바로 적용됩니다.
             </span>
           </div>
           <div className="relative min-h-80 flex-1 p-3">
