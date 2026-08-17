@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Chart,
   LineController,
@@ -499,23 +499,10 @@ export function PortfolioChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [series, activeTab]);
 
-  // Risk/return scatter: grid-search every 10%-step weight combination
-  // across the current tickers, plot each combo's return (y) against its
-  // max drawdown (x — since MDD is <= 0, more negative naturally lands
-  // further left, so "right = safer" falls out for free). Two ways to
-  // measure "return": average rolling N-year holding-period CAGR, or a
-  // single lump-sum invested at the very first date and held to the last.
-  useEffect(() => {
-    if (activeTab !== "risk" || !riskCanvasRef.current) return;
-
-    const tickerSeries = series.filter((s) => s.id !== "portfolio");
-    if (tickerSeries.length < 2) {
-      setRiskEmpty("2개 이상의 종목이 있어야 비중 조합을 비교할 수 있습니다");
-      setParetoCombos([]);
-      return;
-    }
-
-    function computeMetrics(data: SeriesPoint[]) {
+  // Shared by both risk-tab effects below, so its identity only changes
+  // when the thing it actually depends on (riskMode/holdingYears) changes.
+  const computeMetrics = useCallback(
+    (data: SeriesPoint[]) => {
       const sharpe = computeSharpeRatio(data);
       const sortino = computeSortinoRatio(data);
 
@@ -551,6 +538,30 @@ export function PortfolioChart({
         sortino,
         calmar: computeCalmarRatio(summary.avgCagr, summary.avgMaxDrawdown),
       };
+    },
+    [riskMode, holdingYears],
+  );
+
+  // Risk/return scatter: grid-search every 10%-step weight combination
+  // across the current tickers, plot each combo's return (y) against its
+  // max drawdown (x — since MDD is <= 0, more negative naturally lands
+  // further left, so "right = safer" falls out for free). Two ways to
+  // measure "return": average rolling N-year holding-period CAGR, or a
+  // single lump-sum invested at the very first date and held to the last.
+  //
+  // Deliberately does NOT depend on `weights` - the grid itself (hundreds
+  // of combos, each running Sharpe/Sortino/rolling-CAGR) is independent of
+  // the live slider position, so re-running all of it on every drag frame
+  // would make the tab janky for no reason. The "현재 비중" star alone
+  // reacts to `weights`, in the separate effect below.
+  useEffect(() => {
+    if (activeTab !== "risk" || !riskCanvasRef.current) return;
+
+    const tickerSeries = series.filter((s) => s.id !== "portfolio");
+    if (tickerSeries.length < 2) {
+      setRiskEmpty("2개 이상의 종목이 있어야 비중 조합을 비교할 수 있습니다");
+      setParetoCombos([]);
+      return;
     }
 
     const combos = generateWeightCombinations(tickerSeries.length);
@@ -598,29 +609,12 @@ export function PortfolioChart({
     const paretoPoints = comboPoints.filter((_, i) => isPareto[i] && !singleAssetIndices.has(i));
     const normalPoints = comboPoints.filter((_, i) => !isPareto[i] && !singleAssetIndices.has(i));
 
-    // Uses the live slider weights (not the last-analyzed "portfolio"
-    // series), so the star always reflects whatever ratio is currently
-    // selected even if it hasn't been re-analyzed yet.
-    const currentWeightsArray = tickerSeries.map((t) => weights[t.id] ?? 0);
-    const currentTotalWeight = currentWeightsArray.reduce((sum, w) => sum + w, 0);
-    let currentPoint: ComboPoint | null = null;
-    if (currentTotalWeight > 0) {
-      const currentCombined = combineWeightedSeries(tickerSeries, currentWeightsArray);
-      const metrics = computeMetrics(currentCombined);
-      if (metrics) {
-        currentPoint = {
-          weights: currentWeightsArray,
-          ...metrics,
-          label: `현재 비중 (${formatWeightRatio(tickerSeries, currentWeightsArray)})`,
-        };
-      }
-    }
-
     const details = new Map<string, ComboPoint>();
     normalPoints.forEach((p, i) => details.set(`0:${i}`, p));
     paretoPoints.forEach((p, i) => details.set(`1:${i}`, p));
     singleAssetData.forEach((d, i) => details.set(`2:${i}`, d.point));
-    if (currentPoint) details.set(`3:0`, currentPoint);
+    // Dataset 3 ("현재 비중") starts empty here and is filled in by the
+    // effect below, which is the only one that reacts to `weights`.
     riskDetailRef.current = details;
 
     riskChartRef.current = new Chart(riskCanvasRef.current, {
@@ -653,22 +647,21 @@ export function PortfolioChart({
             pointBorderColor: MARKER_RING_COLOR,
             pointBorderWidth: 1.5,
           },
-          ...(currentPoint
-            ? [
-                {
-                  label: "현재 비중",
-                  data: [{ x: currentPoint.mddPct, y: currentPoint.returnPct }],
-                  showLine: false,
-                  pointRadius: 11,
-                  pointHoverRadius: 13,
-                  pointStyle: "star" as const,
-                  pointBackgroundColor: CURRENT_COMBO_COLOR,
-                  pointBorderColor: "#ffffff",
-                  pointBorderWidth: 2,
-                  order: 1,
-                },
-              ]
-            : []),
+          {
+            // Populated/updated by the weights-reactive effect below, not
+            // here - kept as an always-present dataset (even when empty) so
+            // its index (3) and style stay stable across weight changes.
+            label: "현재 비중",
+            data: [],
+            showLine: false,
+            pointRadius: 11,
+            pointHoverRadius: 13,
+            pointStyle: "star" as const,
+            pointBackgroundColor: CURRENT_COMBO_COLOR,
+            pointBorderColor: "#ffffff",
+            pointBorderWidth: 2,
+            order: 1,
+          },
         ],
       },
       options: {
@@ -763,7 +756,44 @@ export function PortfolioChart({
       riskChartRef.current?.destroy();
       riskChartRef.current = null;
     };
-  }, [series, activeTab, holdingYears, riskMode, weights, onApplyWeights]);
+  }, [series, activeTab, holdingYears, riskMode, computeMetrics, onApplyWeights]);
+
+  // Updates just the "현재 비중" star on the risk chart in place - the
+  // cheap part of the risk tab that's actually supposed to track the
+  // slider live, split out from the expensive grid-search effect above so
+  // dragging a weight slider doesn't re-run the whole grid on every frame.
+  useEffect(() => {
+    const chart = riskChartRef.current;
+    if (activeTab !== "risk" || !chart) return;
+
+    const tickerSeries = series.filter((s) => s.id !== "portfolio");
+    if (tickerSeries.length < 2) return;
+
+    const currentWeightsArray = tickerSeries.map((t) => weights[t.id] ?? 0);
+    const currentTotalWeight = currentWeightsArray.reduce((sum, w) => sum + w, 0);
+    let currentPoint: ComboPoint | null = null;
+    if (currentTotalWeight > 0) {
+      const currentCombined = combineWeightedSeries(tickerSeries, currentWeightsArray);
+      const metrics = computeMetrics(currentCombined);
+      if (metrics) {
+        currentPoint = {
+          weights: currentWeightsArray,
+          ...metrics,
+          label: `현재 비중 (${formatWeightRatio(tickerSeries, currentWeightsArray)})`,
+        };
+      }
+    }
+
+    const starDataset = chart.data.datasets[3];
+    if (!starDataset) return;
+    starDataset.data = currentPoint ? [{ x: currentPoint.mddPct, y: currentPoint.returnPct }] : [];
+    if (currentPoint) {
+      riskDetailRef.current.set("3:0", currentPoint);
+    } else {
+      riskDetailRef.current.delete("3:0");
+    }
+    chart.update("none");
+  }, [series, activeTab, weights, computeMetrics]);
 
   // DCA (dollar-cost-averaging) growth curve: simulate buying in fixed
   // monthly amounts at the current target weights, with and without
